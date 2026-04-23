@@ -1,0 +1,122 @@
+{
+  /**
+   * @description Configuración del compilador de TypeScript para un proyecto Next.js moderno.
+   * Incluye las mejores prácticas para chequeo de tipos estricto, resolución de módulos,
+   * y compatibilidad con el ecosistema de React y Next.js.
+   */
+  "compilerOptions": {
+    /* =================== CHEQUEO DE TIPOS ESTRICTO (LOS JUGUETES MÁS IMPORTANTES) =================== */
+    /**
+     * @description Habilita todas las opciones de chequeo de tipo estrictas. Es la base de un código robusto.
+     */
+    "strict": true,
+    /**
+     * @description Reporta errores en funciones que tienen rutas de código que no devuelven un valor.
+     */
+    "noImplicitReturns": true,
+    /**
+     * @description Reporta un error cuando un 'case' en una declaración 'switch' no tiene 'break' o 'return'.
+     */
+    "noFallthroughCasesInSwitch": true,
+    /**
+     * @description Asegura que las importaciones con 'import' se usen consistentemente.
+     */
+    "forceConsistentCasingInFileNames": true,
+
+    /* =================== CONFIGURACIÓN DEL ENTORNO Y MÓDULOS =================== */
+    /**
+     * @description Especifica la versión de ECMAScript a la que se compilará el código. 'ESNext' es la más reciente.
+     */
+    "target": "ESNext",
+    /**
+     * @description Especifica las bibliotecas de tipos que se incluirán. 'dom.iterable' añade soporte para iteradores en el DOM.
+     */
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    /**
+     * @description Especifica el sistema de módulos. Next.js requiere 'esnext' para características modernas.
+     */
+    "module": "esnext",
+    /**
+     * @description Estrategia de resolución de módulos. Debe ser 'node' para soportar resolveJsonModule.
+     */
+    "moduleResolution": "node",
+    /**
+     * @description Permite la interoperabilidad entre módulos CommonJS y ES Modules.
+     */
+    "esModuleInterop": true,
+    /**
+     * @description Permite compilar módulos de JavaScript (útil para dependencias de terceros).
+     */
+    "allowJs": true,
+    /**
+     * @description No reporta errores en código inalcanzable.
+     */
+    "allowUnreachableCode": false,
+
+    /* =================== CONFIGURACIÓN DE NEXT.JS Y REACT =================== */
+    /**
+     * @description Especifica cómo se maneja JSX. 'preserve' mantiene el JSX para que Next.js lo transforme.
+     */
+    "jsx": "preserve",
+    /**
+     * @description Procesa los archivos de declaración de tipos (.d.ts).
+     */
+    "resolveJsonModule": true,
+    /**
+     * @description No emite archivos de salida (Next.js se encarga de la compilación).
+     */
+    "noEmit": true,
+    /**
+     * @description Garantiza que el proyecto está aislado y no se contamina con otros.
+     */
+    "isolatedModules": true,
+    /**
+     * @description Incrementa la velocidad de compilación.
+     */
+    "incremental": true,
+
+    /* =================== ALIAS DE RUTA (PARA IMPORTACIONES LIMPIAS) =================== */
+    /**
+     * @description Define el directorio base para resolver rutas no relativas.
+     */
+    "baseUrl": ".",
+    /**
+     * @description Crea alias para las rutas de importación. '@/*' apuntará a 'src/*'.
+     */
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ]
+    },
+
+    /* =================== PLUGINS Y OTRAS CONFIGURACIONES =================== */
+    /**
+     * @description Añade plugins para mejorar la experiencia con el editor de código.
+     */
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "skipLibCheck": true
+  },
+  /**
+   * @description Especifica los archivos y directorios que serán incluidos en la compilación.
+   */
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts"
+  ],
+  /**
+   * @description Especifica los archivos y directorios que serán excluidos de la compilación.
+   */
+  "exclude": [
+    "node_modules"
+  ]
+}

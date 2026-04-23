@@ -1,0 +1,119 @@
+{
+  /**
+   * @description Configuración del compilador de TypeScript para un proyecto backend (NestJS/Node).
+   * Incluye opciones recomendadas para decorators, generación de tipos, Prisma y salida a `dist/`.
+   */
+  "compilerOptions": {
+    /* =================== MÓDULOS Y COMPILACIÓN =================== */
+    /**
+     * @description Define el sistema de módulos. `commonjs` es el estándar en Node.js.
+     */
+    "module": "commonjs",
+    /**
+     * @description Genera archivos de declaración `.d.ts` junto al JavaScript compilado.
+     */
+    "declaration": true,
+    /**
+     * @description Elimina los comentarios en los archivos compilados.
+     */
+    "removeComments": true,
+
+    /* =================== DECORADORES Y METADATOS =================== */
+    /**
+     * @description Habilita la emisión de metadatos necesarios para Decorators (usado en NestJS).
+     */
+    "emitDecoratorMetadata": true,
+    /**
+     * @description Activa el soporte experimental para Decorators.
+     */
+    "experimentalDecorators": true,
+
+    /* =================== IMPORTACIONES =================== */
+    /**
+     * @description Permite usar `import x from '...'` en módulos CommonJS.
+     */
+    "allowSyntheticDefaultImports": true,
+
+    /* =================== TARGET Y MAPAS DE FUENTE =================== */
+    /**
+     * @description Define la versión de JavaScript objetivo para la salida.
+     */
+    "target": "es2021",
+    /**
+     * @description Genera archivos `.map` para depuración con herramientas como VSCode.
+     */
+    "sourceMap": true,
+
+    /* =================== DIRECTORIOS =================== */
+    /**
+     * @description Carpeta de salida para los archivos compilados.
+     */
+    "outDir": "./dist",
+    /**
+     * @description Define la ruta base para resolver módulos no relativos.
+     */
+    "baseUrl": "./",
+
+    /* =================== RENDIMIENTO =================== */
+    /**
+     * @description Habilita compilación incremental (más rápida en builds sucesivas).
+     */
+    "incremental": true,
+    /**
+     * @description Omite la verificación de tipos en archivos de librerías externas.
+     */
+    "skipLibCheck": true,
+
+    /* =================== REGLAS DE TIPADO =================== */
+    /**
+     * @description Permite valores `null` y `undefined` sin chequeos estrictos.
+     */
+    "strictNullChecks": false,
+    /**
+     * @description Permite variables sin tipo explícito (`any`).
+     */
+    "noImplicitAny": false,
+    /**
+     * @description Desactiva la verificación estricta en `bind`, `call` y `apply`.
+     */
+    "strictBindCallApply": false,
+    /**
+     * @description Desactiva chequeo de consistencia en nombres de archivos (útil en Windows).
+     */
+    "forceConsistentCasingInFileNames": false,
+    /**
+     * @description Desactiva error por casos `switch` sin `break` o `return`.
+     */
+    "noFallthroughCasesInSwitch": false,
+
+    /* =================== RESOLUCIÓN DE MÓDULOS =================== */
+    /**
+     * @description Define cómo se resuelven los módulos. `node` sigue las reglas de Node.js.
+     */
+    "moduleResolution": "node",
+    /**
+     * @description Incluye definiciones de tipos para Node.js y Prisma Client.
+     * Nota: Prisma agrega automáticamente sus tipos en `.prisma/client`, no hace falta importarlos manualmente.
+     */
+    "types": ["node", "@types/node"]
+  },
+
+  /* =================== INCLUSIÓN Y EXCLUSIÓN =================== */
+  /**
+   * @description Especifica los archivos y directorios que serán incluidos en la compilación.
+   */
+  "include": [
+    "src/**/*",
+    "types",           
+    "prisma/**/*"
+   ],
+  /**
+   * @description Especifica los archivos y directorios que serán excluidos de la compilación.
+   */
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test",
+    "coverage"
+  ]
+}

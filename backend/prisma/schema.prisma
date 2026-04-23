@@ -1,0 +1,201 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String       @id @default(cuid())
+  email     String       @unique
+  password  String
+  name      String
+  role      Role         @default(USER)
+  status    users_status @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  lastLogin DateTime?
+  settings  String?      @db.LongText
+  alerts    Alert[]
+  reports   Report[]
+  tanks     Tank[]
+
+  @@map("users")
+}
+
+model Tank {
+  id         String       @id @default(cuid())
+  name       String
+  location   String
+  status     TankStatus   @default(ACTIVE)
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  userId     String
+  sensorData SensorData[]
+  sensors    Sensor[]
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "tanks_userId_fkey")
+  @@map("tanks")
+}
+
+model Sensor {
+  id              String       @id @default(cuid())
+  hardwareId      String       @unique(map: "hardwareId")
+  name            String
+  type            sensors_type
+  location        String
+  status          SensorStatus @default(ACTIVE)
+  calibrationDate DateTime
+  lastReading     Float?
+  lastUpdate      DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  tankId          String
+  alerts          Alert[]
+  sensorData      SensorData[]
+  tank            Tank         @relation(fields: [tankId], references: [id], onDelete: Cascade)
+
+  @@index([tankId], map: "sensors_tankId_fkey")
+  @@map("sensors")
+}
+
+model SensorData {
+  id        String           @id @default(cuid())
+  value     Float
+  type      sensor_data_type
+  timestamp DateTime         @default(now())
+  createdAt DateTime         @default(now())
+  sensorId  String
+  tankId    String
+  sensor    Sensor           @relation(fields: [sensorId], references: [id], onDelete: Cascade)
+  tank      Tank             @relation(fields: [tankId], references: [id], onDelete: Cascade)
+
+  @@index([timestamp])
+  @@index([sensorId, timestamp])
+  @@index([tankId], map: "sensor_data_tankId_fkey")
+  @@map("sensor_data")
+}
+
+model Alert {
+  id         String        @id @default(cuid())
+  type       AlertType
+  severity   AlertSeverity
+  message    String        @db.Text
+  value      Float?
+  threshold  Float?
+  resolved   Boolean       @default(false)
+  resolvedAt DateTime?
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  sensorId   String
+  userId     String?
+  sensor     Sensor        @relation(fields: [sensorId], references: [id], onDelete: Cascade)
+  user       User?         @relation(fields: [userId], references: [id])
+
+  @@index([createdAt])
+  @@index([resolved])
+  @@index([sensorId], map: "alerts_sensorId_fkey")
+  @@index([userId], map: "alerts_userId_fkey")
+  @@map("alerts")
+}
+
+model Report {
+  id         String       @id @default(cuid())
+  title      String
+  type       ReportType
+  parameters String       @db.LongText
+  filePath   String?
+  status     ReportStatus @default(PENDING)
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  userId     String
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@index([userId], map: "reports_userId_fkey")
+  @@map("reports")
+}
+
+model SystemConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       String   @db.Text
+  description String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("system_config")
+}
+
+enum Role {
+  ADMIN
+  USER
+}
+
+enum TankStatus {
+  ACTIVE
+  MAINTENANCE
+  INACTIVE
+}
+
+enum SensorStatus {
+  ACTIVE
+  INACTIVE
+  MAINTENANCE
+  ERROR
+}
+
+enum AlertType {
+  TEMPERATURE_HIGH
+  TEMPERATURE_LOW
+  PH_HIGH
+  PH_LOW
+  OXYGEN_HIGH
+  OXYGEN_LOW
+  SENSOR_OFFLINE
+  SYSTEM_ERROR
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ReportType {
+  DAILY
+  WEEKLY
+  MONTHLY
+  CUSTOM
+}
+
+enum ReportStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum users_status {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum sensors_type {
+  TEMPERATURE
+  PH
+  OXYGEN
+}
+
+enum sensor_data_type {
+  TEMPERATURE
+  PH
+  OXYGEN
+  LEVEL
+  FLOW
+}

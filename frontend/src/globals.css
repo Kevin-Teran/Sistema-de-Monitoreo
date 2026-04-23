@@ -1,0 +1,235 @@
+/**
+ * @file globals.css
+ * @route /frontend/src
+ * @description Archivo de estilos globales mejorado, robusto y escalable.
+ * Utiliza variables CSS para un sistema de diseño centralizado (colores, espaciado, tipografía),
+ * facilitando el mantenimiento y la tematización (ej. modo oscuro).
+ * @author Kevin Mariano
+ * @version 1.0.0
+ * @since 1.0.0
+ *@copyright Sistema de Monitoreo  2025
+ */
+
+/* ==========================================================================
+   1. Directivas de Tailwind CSS
+   ========================================================================== */
+/**
+ * @description Importaciones base de Tailwind.
+ * `base` - Estilos fundamentales y reseteos del navegador.
+ * `components` - Clases de componentes de Tailwind.
+ * `utilities` - Clases de utilidad de Tailwind.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   2. Variables del Sistema de Diseño (CSS Custom Properties)
+   ========================================================================== */
+/**
+ * @description Definición de variables globales para mantener la consistencia
+ * visual en toda la aplicación. Facilita la tematización
+ * (modo claro/oscuro) y el mantenimiento.
+ */
+@layer base {
+  :root {
+    /* Paleta de Colores Primarios (SENA) */
+    --color-primary: #39a900; /* Verde SENA */
+    --color-primary-hover: #2d8600;
+
+    /* Paleta de Colores de Fondo */
+    --color-background: #f3f4f6; /* gray-100 */
+    --color-foreground: #ffffff; /* Contenedores, tarjetas, etc. */
+
+    /* Paleta de Colores de Texto */
+    --color-text-primary: #1f2937; /* gray-800 */
+    --color-text-secondary: #4b5563; /* gray-600 */
+    --color-text-muted: #9ca3af; /* gray-400 */
+
+    /* Paleta de Colores para Bordes y Divisores */
+    --color-border: #d1d5db; /* gray-300 */
+
+    /* Sistema de Espaciado */
+    --spacing-1: 0.25rem; /* 4px */
+    --spacing-2: 0.5rem; /* 8px */
+    --spacing-4: 1rem; /* 16px */
+    --spacing-6: 1.5rem; /* 24px */
+    --spacing-8: 2rem; /* 32px */
+
+    /* Tipografía */
+    --font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI',
+      Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif,
+      'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol',
+      'Noto Color Emoji';
+
+    /* Radios de Borde (Border Radius) */
+    --border-radius-md: 0.375rem; /* 6px */
+    --border-radius-lg: 0.5rem; /* 8px */
+
+    /* Sombras (Shadows) */
+    --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1),
+      0 2px 4px -2px rgb(0 0 0 / 0.1);
+  }
+
+  /* Variables para el Modo Oscuro */
+  .dark {
+    /* Paleta de Colores de Fondo */
+    --color-background: #111827; /* gray-900 */
+    --color-foreground: #1f2937; /* gray-800 */
+
+    /* Paleta de Colores de Texto */
+    --color-text-primary: #f9fafb; /* gray-50 */
+    --color-text-secondary: #9ca3af; /* gray-400 */
+    --color-text-muted: #4b5563; /* gray-600 */
+
+    /* Paleta de Colores para Bordes y Divisores */
+    --color-border: #374151; /* gray-700 */
+  }
+}
+
+/* ==========================================================================
+   3. Estilos Base Globales
+   ========================================================================== */
+@layer base {
+  html,
+  body {
+    @apply h-full;
+  }
+
+  body {
+    @apply bg-[var(--color-background)] text-[var(--color-text-primary)] font-sans antialiased;
+    scroll-behavior: smooth;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  * {
+    @apply border-[var(--color-border)];
+  }
+}
+
+/* ==========================================================================
+   4. Componentes Personalizados Reutilizables
+   ========================================================================== */
+@layer components {
+  /* Contenedor principal para centrar contenido */
+  .container {
+    @apply w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;
+  }
+
+  /* Tarjeta genérica */
+  .card {
+    @apply bg-[var(--color-foreground)] rounded-lg shadow-md p-4 sm:p-6;
+  }
+
+  /* Entradas de Formulario */
+  .form-input,
+  .form-select {
+    @apply w-full p-2 border rounded-lg bg-[var(--color-foreground)] transition-colors;
+    @apply focus:ring-2 focus:ring-[var(--color-primary)];
+  }
+
+  /* Etiquetas de Formulario */
+  .label {
+    @apply block text-sm font-medium text-[var(--color-text-secondary)] mb-1;
+  }
+
+  /* Botones */
+  .btn {
+    @apply inline-flex items-center justify-center font-semibold rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn px-4 py-2 bg-[var(--color-primary)] text-white shadow-md;
+    @apply hover:bg-[var(--color-primary-hover)];
+  }
+  .btn-secondary {
+    @apply btn px-4 py-2 bg-[var(--color-foreground)] text-[var(--color-text-primary)] border;
+    @apply hover:bg-gray-100 dark:hover:bg-gray-700;
+  }
+
+  /* Toggle Switch */
+  .toggle-checkbox {
+    @apply appearance-none relative w-11 h-6 bg-gray-300 dark:bg-gray-600 rounded-full cursor-pointer transition-colors duration-200 ease-in-out;
+  }
+  .toggle-checkbox:checked {
+    @apply bg-[var(--color-primary)];
+  }
+  .toggle-checkbox::before {
+    @apply content-[''] absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform duration-200 ease-in-out;
+  }
+  .toggle-checkbox:checked::before {
+    @apply transform translate-x-5;
+  }
+}
+
+/* ==========================================================================
+   5. Utilidades y Overrides
+   ========================================================================== */
+@layer utilities {
+  /**
+   * @animation animate-fill-up
+   * @description Animación para el logo del SENA en el spinner, creando un efecto de "llenado" vertical.
+   */
+  .animate-fill-up {
+    clip-path: inset(100% 0 0 0);
+    animation: fill-up 2s infinite ease-in-out;
+  }
+
+  @keyframes fill-up {
+    0% {
+      clip-path: inset(100% 0 0 0);
+    }
+    50% {
+      clip-path: inset(0 0 0 0);
+    }
+    100% {
+      clip-path: inset(0 0 0 0);
+    }
+  }
+
+  /**
+   * @animation animate-pulse-dot
+   * @description Animación de pulso para los puntos de carga.
+   */
+  .animate-pulse-dot {
+    animation: pulse-dot 1.4s infinite ease-in-out both;
+  }
+
+  @keyframes pulse-dot {
+    0%,
+    80%,
+    100% {
+      transform: scale(0.8);
+      opacity: 0.5;
+    }
+    40% {
+      transform: scale(1);
+      opacity: 1;
+    }
+  }
+}
+
+/* ==========================================================================
+   6. Overrides Específicos
+   ========================================================================== */
+/*
+  Estilos para forzar el color del placeholder en los inputs,
+  usando las variables de texto para consistencia.
+*/
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-text-muted);
+}
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: var(--color-text-muted);
+}
+
+/*
+  Forzar el color del texto al escribir en un input en modo oscuro
+  para asegurar legibilidad.
+*/
+.dark input,
+.dark textarea,
+.dark select {
+  color: var(--color-text-primary);
+}
