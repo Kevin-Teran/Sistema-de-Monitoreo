@@ -3,10 +3,10 @@
  * @route frontend/src/services
  * @description Servicio REFORZADO para obtener datos del clima desde OpenWeatherMap API.
  * Soporta coordenadas (Lat, Lon) y nombres de ciudades.
+ * FIX: Usar formato ISO (yyyy-MM-dd) para fechas, evitando Invalid Date.
  * @author Kevin Mariano
- * @version 2.1.0
+ * @version 2.2.1
  * @since 1.0.0
- *@copyright Sistema de Monitoreo  2025
  */
 
 const WEATHER_API_KEY = process.env.NEXT_PUBLIC_OPENWEATHERMAP_API_KEY || '56661711020895ed3c361ae25d46de7a';
@@ -35,7 +35,7 @@ interface OpenWeatherResponse {
 }
 
 export interface WeatherForecast {
-  date: string;
+  date: string; // ISO format: yyyy-MM-dd
   temp: number;
   temp_min: number;
   temp_max: number;
@@ -62,6 +62,18 @@ const parseCoordinates = (location: string): { lat: number; lon: number } | null
     }
   }
   return null;
+};
+
+/**
+ * @description Formatea una fecha Unix timestamp a formato ISO yyyy-MM-dd
+ * Esto es CRÍTICO para evitar Invalid Date al parsear después con new Date()
+ */
+const formatToIsoDate = (dt: number): string => {
+  const date = new Date(dt * 1000);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 };
 
 /**
@@ -94,7 +106,6 @@ export const getWeatherForecast = async (
     const response = await fetch(apiUrl, { cache: 'no-store' });
 
     if (!response.ok) {
-      // Manejo específico si la ciudad no existe (404)
       if (response.status === 404) {
         console.warn(`⚠️ Ciudad no encontrada: ${location}`);
       } else {
@@ -119,24 +130,25 @@ export const getWeatherForecast = async (
 
 /**
  * @description Procesa los datos crudos de la API
+ * FIX: Usar formatToIsoDate() en lugar de toLocaleDateString() para evitar Invalid Date
  */
 const processForecastData = (forecastList: OpenWeatherItem[], days: number): WeatherForecast[] => {
-  const dailyData: { [date: string]: OpenWeatherItem[] } = {};
+  const dailyData: { [isoDate: string]: OpenWeatherItem[] } = {};
 
   forecastList.forEach((item) => {
-    const date = new Date(item.dt * 1000).toLocaleDateString('es-CO', {
-        year: 'numeric', month: '2-digit', day: '2-digit'
-    });
+    // FIX CRÍTICO: Usar formato ISO yyyy-MM-dd en lugar de toLocaleDateString
+    // toLocaleDateString('es-CO') produce "15/01/2025" que new Date() NO puede parsear
+    const isoDate = formatToIsoDate(item.dt);
     
-    if (!dailyData[date]) {
-      dailyData[date] = [];
+    if (!dailyData[isoDate]) {
+      dailyData[isoDate] = [];
     }
-    dailyData[date].push(item);
+    dailyData[isoDate].push(item);
   });
 
   const dailyForecasts: WeatherForecast[] = Object.entries(dailyData)
     .slice(0, days)
-    .map(([date, items]) => {
+    .map(([isoDate, items]) => {
       const temps = items.map(i => i.main.temp);
       const temps_min = items.map(i => i.main.temp_min);
       const temps_max = items.map(i => i.main.temp_max);
@@ -146,7 +158,7 @@ const processForecastData = (forecastList: OpenWeatherItem[], days: number): Wea
       const representativeItem = items[Math.floor(items.length / 2)];
 
       return {
-        date,
+        date: isoDate, // ISO format: "2025-01-15" - parseado correctamente por new Date()
         temp: Math.round(average(temps) * 10) / 10, 
         temp_min: Math.min(...temps_min),
         temp_max: Math.max(...temps_max),
