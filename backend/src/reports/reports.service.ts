@@ -12,24 +12,65 @@
  *@copyright Sistema de Monitoreo  2025
  */
 
-import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  BadRequestException,
+  OnModuleInit,
+} from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { EventsGateway } from '../events/events.gateway';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import * as ExcelJS from 'exceljs';
 import * as PDFDocument from 'pdfkit';
-import { Report, ReportStatus, SensorData, ReportType } from '@prisma/client'; 
+import { Report, ReportStatus, ReportType } from '@prisma/client';
 import { format, startOfDay, endOfDay, parseISO } from 'date-fns';
 import { es } from 'date-fns/locale';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { EmailService } from '../email/email.service'; // <--- NUEVA IMPORTACIÓN
-
+import { EmailService } from '../email/email.service';
+ 
+// ─── Constantes de Configuración ──────────────────────────────────────────────
+ 
+/** Directorio donde se guardan los reportes generados */
+const REPORTS_DIR = path.join(process.cwd(), 'reports');
+ 
+/** Tiempo máximo (ms) para procesar un reporte antes de marcarlo como FAILED */
+const REPORT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos
+ 
+/** Número máximo de reintentos para un reporte fallido */
+const MAX_RETRIES = 3;
+ 
+/** Tiempo base de espera entre reintentos (ms), se multiplica exponencialmente */
+const RETRY_BASE_DELAY_MS = 10_000; // 10 segundos
+ 
+/** Máximo de reportes procesándose al mismo tiempo */
+const MAX_CONCURRENT_WORKERS = 2;
+ 
+/** Lotes de datos máximos a incluir en el detalle del PDF/Excel */
+const MAX_DATA_ROWS_PDF = 500;
+ 
+// ─── Interfaces (I - Segregación de Interfaces) ────────────────────────────────
+ 
 interface ReportFilePaths {
   pdfPath: string;
   excelPath: string;
 }
-
+ 
+interface ReportParameters {
+  tankId: string;
+  tankName: string;
+  sensorIds: string[];
+  sensorNames: string[];
+  startDate: string;
+  endDate: string;
+  isAutomatic?: boolean;
+  automaticType?: 'batch' | 'daily';
+  retryCount?: number;
+}
+ 
 interface CreateReportDto {
   reportName: string;
   userId: string;
@@ -39,955 +80,926 @@ interface CreateReportDto {
   endDate: string;
   isAutomatic?: boolean;
 }
-
-interface ReportParameters {
-  tankId: string;
-  tankName: string;
-  sensorIds: string[];
-  sensorNames: string[];
-  startDate: string;
-  endDate: string;
-  dataCount?: number;
-  isAutomatic?: boolean;
-  automaticType?: 'batch' | 'daily';
+ 
+interface AggregatedStat {
+  sensorName: string;
+  count: number;
+  avg: string;
+  min: string;
+  max: string;
 }
-
+ 
+// ─── Clase Principal ───────────────────────────────────────────────────────────
+ 
 @Injectable()
-export class ReportService {
+export class ReportService implements OnModuleInit {
   private readonly logger = new Logger(ReportService.name);
-  private readonly reportsDir = path.join(process.cwd(), 'reports');
-  private readonly assetsDir = path.join(process.cwd(), 'src', 'assets'); 
+ 
+  /** Contador de datos recibidos por tanque (para reportes automáticos por lote) */
   private dataCounters = new Map<string, number>();
-
+ 
+  /** Cola de trabajos pendientes (IDs de reportes) */
+  private readonly jobQueue: string[] = [];
+ 
+  /** Conjunto de reportes actualmente en procesamiento */
+  private readonly activeWorkers = new Set<string>();
+ 
   constructor(
-    private prisma: PrismaService,
-    private eventsGateway: EventsGateway,
-    private emailService: EmailService, 
-  ) {
-    this.ensureReportsDirectory();
-    this.initializeDataCounters();
+    private readonly prisma: PrismaService,
+    private readonly eventsGateway: EventsGateway,
+    private readonly emailService: EmailService,
+  ) {}
+ 
+  // ─── Ciclo de Vida del Módulo ────────────────────────────────────────────────
+ 
+  async onModuleInit(): Promise<void> {
+    await this.ensureReportsDirectory();
+    await this.initializeDataCounters();
+    await this.recoverStuckReports();
+    this.logger.log('✅ ReportService inicializado correctamente');
   }
-
-  // ---------------------- Métodos Auxiliares ----------------------
-
+ 
+  /** Asegura que el directorio de reportes exista */
+  private async ensureReportsDirectory(): Promise<void> {
+    await fs.mkdir(REPORTS_DIR, { recursive: true });
+    this.logger.log(`📁 Directorio de reportes: ${REPORTS_DIR}`);
+  }
+ 
+  /** Inicializa contadores de datos por tanque */
+  private async initializeDataCounters(): Promise<void> {
+    const tanks = await this.prisma.tank.findMany({ select: { id: true } });
+    tanks.forEach((tank) => this.dataCounters.set(tank.id, 0));
+    this.logger.log(`📊 Contadores inicializados para ${tanks.length} tanques`);
+  }
+ 
   /**
-   * Asegura que el directorio de reportes existe
+   * Al iniciar, los reportes que quedaron en PENDING/PROCESSING del ciclo anterior
+   * (por reinicio del servidor, crash, etc.) se reactivan o se marcan como FAILED.
    */
-  private async ensureReportsDirectory() {
-    try {
-      await fs.mkdir(this.reportsDir, { recursive: true });
-      this.logger.log(`📁 Directorio de reportes: ${this.reportsDir}`);
-    } catch (error) {
-      this.logger.error('Error creando directorio de reportes:', error);
+  private async recoverStuckReports(): Promise<void> {
+    const cutoff = new Date(Date.now() - REPORT_TIMEOUT_MS);
+ 
+    // Reportes PROCESSING más viejos que el timeout → FAILED
+    const stuckProcessing = await this.prisma.report.updateMany({
+      where: {
+        status: 'PROCESSING',
+        updatedAt: { lt: cutoff },
+      },
+      data: { status: 'FAILED' },
+    });
+ 
+    // Reportes PENDING más viejos que el timeout → volver a encolar
+    const stuckPending = await this.prisma.report.findMany({
+      where: {
+        status: 'PENDING',
+        createdAt: { lt: cutoff },
+      },
+      select: { id: true },
+    });
+ 
+    if (stuckProcessing.count > 0) {
+      this.logger.warn(
+        `⚠️ ${stuckProcessing.count} reportes marcados como FAILED (timeout)`,
+      );
+    }
+ 
+    if (stuckPending.length > 0) {
+      this.logger.warn(
+        `⚠️ ${stuckPending.length} reportes PENDING re-encolados al inicio`,
+      );
+      stuckPending.forEach((r) => this.enqueueJob(r.id));
     }
   }
-
+ 
+  // ─── Cola de Procesamiento (evita bloquear el servidor) ─────────────────────
+ 
   /**
-   * Inicializa los contadores de datos por tanque
+   * Agrega un reporte a la cola y dispara un worker si hay capacidad.
    */
-  private async initializeDataCounters() {
-    try {
-      const tanks = await this.prisma.tank.findMany({ select: { id: true } });
-      for (const tank of tanks) {
-        this.dataCounters.set(tank.id, 0);
+  private enqueueJob(reportId: string): void {
+    if (!this.jobQueue.includes(reportId)) {
+      this.jobQueue.push(reportId);
+    }
+    this.drainQueue();
+  }
+ 
+  /**
+   * Procesa reportes de la cola respetando MAX_CONCURRENT_WORKERS.
+   */
+  private drainQueue(): void {
+    while (
+      this.jobQueue.length > 0 &&
+      this.activeWorkers.size < MAX_CONCURRENT_WORKERS
+    ) {
+      const reportId = this.jobQueue.shift()!;
+      if (!this.activeWorkers.has(reportId)) {
+        this.activeWorkers.add(reportId);
+        this.runWorker(reportId).finally(() => {
+          this.activeWorkers.delete(reportId);
+          this.drainQueue(); // Procesar siguiente en cola
+        });
       }
-      this.logger.log(`✅ Contadores de datos inicializados para ${tanks.length} tanques`);
-    } catch (error) {
-      this.logger.error('Error inicializando contadores:', error);
     }
   }
-
+ 
   /**
-   * Obtiene y parsea las rutas de archivos guardadas como JSON en report.filePath
+   * Ejecuta el procesamiento del reporte con timeout y manejo de errores.
    */
-  private getReportPaths(report: Report): ReportFilePaths | null {
-    if (!report.filePath) return null;
+  private async runWorker(reportId: string): Promise<void> {
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error('TIMEOUT: procesamiento excedió el límite')),
+        REPORT_TIMEOUT_MS,
+      ),
+    );
+ 
     try {
-        const paths = JSON.parse(report.filePath as string);
-        if (paths.pdfPath && paths.excelPath) {
-            return paths as ReportFilePaths;
-        }
-        return null;
-    } catch (e) {
-        this.logger.error(`Error al parsear el campo filePath del reporte ${report.id}:`, e);
-        return null;
+      await Promise.race([this.processReport(reportId), timeoutPromise]);
+    } catch (err: any) {
+      this.logger.error(`❌ Worker falló para reporte ${reportId}: ${err.message}`);
+      await this.handleReportFailure(reportId, err.message);
     }
   }
-
+ 
   /**
-   * Calcula estadísticas de los sensores para el PDF/Excel (Añadido para estructura)
-  */
-  private aggregateStats(data: any[]): any[] {
-      const sensorGroups = data.reduce((acc, item) => {
-          const sensorName = item.sensor.name;
-          if (!acc[sensorName]) {
-            acc[sensorName] = { values: [], count: 0, sensorName };
-          }
-          acc[sensorName].values.push(item.value);
-          acc[sensorName].count++;
-          return acc;
-      }, {});
-
-      return Object.values(sensorGroups).map((group: any) => ({
-          sensorName: group.sensorName,
-          count: group.count,
-          avg: (group.values.reduce((a, b) => a + b, 0) / group.values.length).toFixed(2),
-          min: Math.min(...group.values).toFixed(2),
-          max: Math.max(...group.values).toFixed(2),
-      }));
-  }
-
-  // ---------------------- Métodos de reportes automáticos ----------------------
-
-  /**
-   * Incrementa el contador de datos y genera reporte automático si es necesario
+   * Gestiona el fallo de un reporte con reintentos automáticos.
    */
-  async incrementDataCounter(tankId: string, userId: string) {
-    const currentCount = this.dataCounters.get(tankId) || 0;
-    const newCount = currentCount + 1;
-    this.dataCounters.set(tankId, newCount);
-
+  private async handleReportFailure(
+    reportId: string,
+    errorMessage: string,
+  ): Promise<void> {
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+    });
+    if (!report) return;
+ 
+    let params: ReportParameters = JSON.parse(report.parameters as string);
+    const retryCount = (params.retryCount ?? 0) + 1;
+ 
+    if (retryCount <= MAX_RETRIES) {
+      // Backoff exponencial: 10s, 20s, 40s
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, retryCount - 1);
+      this.logger.warn(
+        `🔄 Reintento ${retryCount}/${MAX_RETRIES} para reporte ${reportId} en ${delay / 1000}s`,
+      );
+ 
+      params.retryCount = retryCount;
+ 
+      await this.prisma.report.update({
+        where: { id: reportId },
+        data: {
+          status: 'PENDING',
+          parameters: JSON.stringify(params),
+        },
+      });
+ 
+      setTimeout(() => this.enqueueJob(reportId), delay);
+    } else {
+      this.logger.error(
+        `💀 Reporte ${reportId} superó ${MAX_RETRIES} reintentos → FAILED`,
+      );
+      await this.updateReportStatus(reportId, 'FAILED', errorMessage);
+    }
+  }
+ 
+  // ─── Cron Jobs ───────────────────────────────────────────────────────────────
+ 
+  /** Genera reportes diarios a las 23:55 para usuarios con reportes habilitados */
+  @Cron('55 23 * * *', { name: 'daily-reports', timeZone: 'America/Bogota' })
+  async generateDailyReports(): Promise<void> {
+    this.logger.log('🕐 Iniciando reportes diarios automáticos...');
+    const users = await this.prisma.user.findMany({
+      select: { id: true, name: true, settings: true },
+    });
+ 
+    for (const user of users) {
+      const settings = this.parseUserSettings(user.settings);
+      if (!settings.notifications?.reports) continue;
+ 
+      const tanks = await this.prisma.tank.findMany({
+        where: { userId: user.id },
+        include: { sensors: { select: { id: true } } },
+      });
+ 
+      for (const tank of tanks) {
+        const today = new Date();
+        const dataCount = await this.prisma.sensorData.count({
+          where: {
+            sensor: { tankId: tank.id },
+            timestamp: { gte: startOfDay(today), lte: endOfDay(today) },
+          },
+        });
+ 
+        if (dataCount === 0) continue;
+ 
+        await this.createReport({
+          reportName: `Reporte Diario - ${tank.name} - ${format(today, 'dd/MM/yyyy')}`,
+          userId: user.id,
+          tankId: tank.id,
+          sensorIds: tank.sensors.map((s) => s.id),
+          startDate: format(startOfDay(today), 'yyyy-MM-dd'),
+          endDate: format(endOfDay(today), 'yyyy-MM-dd'),
+          isAutomatic: true,
+        });
+      }
+    }
+  }
+ 
+  /** Limpia reportes FAILED/COMPLETED antiguos (>30 días) para liberar disco */
+  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  async cleanupOldReports(): Promise<void> {
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const oldReports = await this.prisma.report.findMany({
+      where: {
+        status: { in: ['FAILED', 'COMPLETED'] },
+        createdAt: { lt: cutoff },
+      },
+    });
+ 
+    let deleted = 0;
+    for (const report of oldReports) {
+      try {
+        await this.deleteReportFiles(report);
+        await this.prisma.report.delete({ where: { id: report.id } });
+        deleted++;
+      } catch (_) {
+        // ignorar errores individuales
+      }
+    }
+ 
+    if (deleted > 0) {
+      this.logger.log(`🧹 Limpieza: ${deleted} reportes antiguos eliminados`);
+    }
+  }
+ 
+  // ─── API Pública ─────────────────────────────────────────────────────────────
+ 
+  /** Incrementa el contador de datos y genera reporte automático si alcanza 200 */
+  async incrementDataCounter(tankId: string, userId: string): Promise<void> {
+    const count = (this.dataCounters.get(tankId) ?? 0) + 1;
+    this.dataCounters.set(tankId, count);
+ 
+    if (count % 200 !== 0) return;
+ 
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { settings: true }
+      select: { settings: true },
     });
-
-    const settings = user?.settings ? JSON.parse(user.settings as string) : {};
-    const reportsEnabled = settings.notifications?.reports === true; 
-
-    if (!reportsEnabled) {
-      return;
-    }
-
-    if (newCount % 200 === 0) {
-      this.logger.log(`🔔 Generando reporte automático por LOTE para tanque ${tankId} (${newCount} datos)`);
-      await this.generateAutomaticBatchReport(tankId, userId);
-    }
+    const settings = this.parseUserSettings(user?.settings);
+    if (!settings.notifications?.reports) return;
+ 
+    this.logger.log(
+      `🔔 Reporte automático por lote para tanque ${tankId} (${count} datos)`,
+    );
+    await this.generateAutomaticBatchReport(tankId, userId);
   }
-
-  /**
-   * Genera un reporte automático cada 200 datos (LOTE/BATCH)
-   */
-  private async generateAutomaticBatchReport(tankId: string, userId: string) {
-    try {
-      const tank = await this.prisma.tank.findUnique({
-        where: { id: tankId },
-        include: { sensors: true }
-      });
-
-      if (!tank) {
-        this.logger.error(`Tanque ${tankId} no encontrado para reporte automático`);
-        return;
-      }
-      
-      const batchData = await this.prisma.sensorData.findMany({
-          where: { sensor: { tankId } },
-          orderBy: { timestamp: 'desc' }, 
-          select: { timestamp: true },
-          take: 200, 
-      });
-
-      if (batchData.length === 0) {
-        this.logger.warn(`No hay datos para reporte por lote del tanque ${tankId}`);
-        return;
-      }
-
-      const newestDataTimestamp = batchData[0].timestamp;
-      const oldestDataTimestamp = batchData[batchData.length - 1].timestamp;
-
-      const dataCount = batchData.length;
-
-      const startTitle = format(oldestDataTimestamp, 'dd/MM/yyyy HH:mm:ss');
-      const endTitle = format(newestDataTimestamp, 'dd/MM/yyyy HH:mm:ss');
-
-      const reportDto: CreateReportDto = {
-        reportName: `Reporte por Lote - ${tank.name} (${dataCount} datos del ${startTitle} al ${endTitle})`,
-        userId,
-        tankId,
-        sensorIds: tank.sensors.map(s => s.id),
-        startDate: oldestDataTimestamp.toISOString(),
-        endDate: newestDataTimestamp.toISOString(),
-        isAutomatic: true,
-      };
-
-      await this.createReport(reportDto);
-    } catch (error) {
-      this.logger.error('Error generando reporte automático por lote:', error);
-    }
-  }
-
-  /**
-   * Cron job: Genera reportes diarios a las 23:55
-   */
-  @Cron('55 23 * * *', {
-    name: 'daily-reports',
-    timeZone: 'America/Bogota',
-  })
-  async generateDailyReports() {
-    this.logger.log('🕐 Iniciando generación de reportes diarios automáticos...');
-
-    try {
-      const users = await this.prisma.user.findMany({
-        select: { id: true, name: true, settings: true },
-      });
-
-      for (const user of users) {
-        const settings = user.settings ? JSON.parse(user.settings as string) : {};
-        const reportsEnabled = settings.notifications?.reports === true; // <--- VERIFICACIÓN DE reports: true
-
-        if (!reportsEnabled) {
-          continue;
-        }
-
-        const tanks = await this.prisma.tank.findMany({
-          where: { userId: user.id },
-          include: { sensors: true }
-        });
-
-        for (const tank of tanks) {
-          const today = new Date();
-          const dataCount = await this.prisma.sensorData.count({
-            where: {
-              sensor: { tankId: tank.id },
-              timestamp: {
-                gte: startOfDay(today),
-                lte: endOfDay(today),
-              },
-            },
-          });
-
-          if (dataCount === 0) {
-            this.logger.log(`⚠️ No hay datos de hoy para el tanque ${tank.name}, saltando reporte diario`);
-            continue;
-          }
-
-          const reportDto: CreateReportDto = {
-            reportName: `Reporte Diario - ${tank.name} - ${format(today, 'dd/MM/yyyy')}`,
-            userId: user.id,
-            tankId: tank.id,
-            sensorIds: tank.sensors.map(s => s.id),
-            startDate: format(startOfDay(today), 'yyyy-MM-dd'),
-            endDate: format(endOfDay(today), 'yyyy-MM-dd'),
-            isAutomatic: true,
-          };
-
-          await this.createReport(reportDto);
-          this.logger.log(`✅ Reporte diario generado para ${user.name} - ${tank.name}`);
-        }
-      }
-    } catch (error) {
-      this.logger.error('❌ Error generando reportes diarios:', error);
-    }
-  }
-
-  // ---------------------- Creación y procesamiento principal ----------------------
-
-  /**
-   * Crea un nuevo reporte (manual o automático)
-   */
-   async createReport(dto: CreateReportDto): Promise<Report> {
-    this.logger.log(`📝 Creando reporte: ${dto.reportName}`);
-
-    if (!dto.tankId || !dto.sensorIds || dto.sensorIds.length === 0) {
+ 
+  /** Crea un nuevo reporte y lo encola para procesamiento asíncrono */
+  async createReport(dto: CreateReportDto): Promise<Report> {
+    if (!dto.tankId || !dto.sensorIds?.length) {
       throw new BadRequestException('Debe especificar un tanque y al menos un sensor');
     }
-
+ 
     const tank = await this.prisma.tank.findUnique({
       where: { id: dto.tankId },
-      include: { sensors: true }
+      include: { sensors: { select: { id: true, name: true } } },
     });
-
-    if (!tank) {
-      throw new NotFoundException(`Tanque ${dto.tankId} no encontrado`);
-    }
-
-    const selectedSensors = tank.sensors.filter(s => dto.sensorIds.includes(s.id));
-
-    if (selectedSensors.length === 0) {
+    if (!tank) throw new NotFoundException(`Tanque ${dto.tankId} no encontrado`);
+ 
+    const selectedSensors = tank.sensors.filter((s) =>
+      dto.sensorIds.includes(s.id),
+    );
+    if (!selectedSensors.length) {
       throw new BadRequestException('No se encontraron sensores válidos');
     }
-
-    let automaticType: ReportParameters['automaticType'] = undefined;
-    if (dto.isAutomatic) {
-        if (dto.reportName.includes('Lote')) {
-            automaticType = 'batch';
-        } else if (dto.reportName.includes('Diario')) {
-            automaticType = 'daily';
-        }
-    }
-    
+ 
+    const isAutomatic = dto.isAutomatic ?? false;
+    const automaticType = isAutomatic
+      ? dto.reportName.includes('Lote')
+        ? 'batch'
+        : 'daily'
+      : undefined;
+ 
     const parameters: ReportParameters = {
       tankId: dto.tankId,
       tankName: tank.name,
       sensorIds: dto.sensorIds,
-      sensorNames: selectedSensors.map(s => s.name),
+      sensorNames: selectedSensors.map((s) => s.name),
       startDate: dto.startDate,
       endDate: dto.endDate,
-      isAutomatic: dto.isAutomatic || false,
-      automaticType: automaticType,
+      isAutomatic,
+      automaticType,
+      retryCount: 0,
     };
-    
-    let reportType: ReportType;
-    if (parameters.isAutomatic && parameters.automaticType === 'daily') {
-        reportType = ReportType.DAILY;
-    } else {
-        reportType = ReportType.CUSTOM; 
-    }
-
+ 
+    const reportType: ReportType =
+      isAutomatic && automaticType === 'daily'
+        ? ReportType.DAILY
+        : ReportType.CUSTOM;
+ 
     const report = await this.prisma.report.create({
       data: {
         title: dto.reportName,
-        user: { 
-          connect: { id: dto.userId },
-        },
+        user: { connect: { id: dto.userId } },
         status: 'PENDING',
         parameters: JSON.stringify(parameters),
-        type: reportType, 
+        type: reportType,
       },
-    }); 
-
-    this.logger.log(`✅ Reporte ${report.id} creado con estado PENDING`);
-
-    this.processReport(report.id).catch(error => {
-      this.logger.error(`Error procesando reporte ${report.id}:`, error);
     });
-
+ 
+    this.logger.log(`📝 Reporte ${report.id} creado → encolando`);
+    this.enqueueJob(report.id);
+ 
     return report;
   }
-  
-  /**
-   * Procesa y genera los archivos del reporte
-   */
-  private async processReport(reportId: string) {
-    this.logger.log(`⚙️ Procesando reporte ${reportId}...`);
-
-    try {
-      await this.updateReportStatus(reportId, 'PROCESSING');
-
-      const report = await this.prisma.report.findUnique({
-        where: { id: reportId },
-        include: { user: true } 
-      });
-
-      if (!report) {
-        throw new NotFoundException('Reporte no encontrado');
-      }
-
-      const params: ReportParameters = JSON.parse(report.parameters as string);
-      
-      let gteDate: Date;
-      let lteDate: Date;
-
-      const isBatchReport = params.isAutomatic && params.automaticType === 'batch';
-      
-      if (isBatchReport) {
-        // 1. Reporte por Lote (Batch): Usar marcas de tiempo exactas (incluye hora, minuto, segundo).
-        gteDate = new Date(params.startDate);
-        lteDate = new Date(params.endDate);
-        this.logger.log(`🔍 [Filtro] Usando filtro preciso para Lote/Batch: ${params.startDate} - ${params.endDate}`);
-      } else {
-        // 2. Reporte Diario y Reporte Manual/Custom: Usar el rango de día completo.
-        gteDate = new Date(params.startDate + 'T00:00:00Z');
-        lteDate = new Date(params.endDate + 'T23:59:59Z');
-        this.logger.log(`🔍 [Filtro] Usando filtro de día completo: ${params.startDate} - ${params.endDate}`);
-      }
-
-
-      const sensorData = await this.prisma.sensorData.findMany({
-        where: {
-          sensorId: { in: params.sensorIds },
-          timestamp: {
-            gte: gteDate,
-            lte: lteDate,
-          },
-        },
-        orderBy: { timestamp: 'asc' },
-        include: {
-          sensor: {
-            select: {
-              name: true,
-              type: true,
-              hardwareId: true,
-            },
-          },
-        },
-      });
-
-      if (sensorData.length === 0) {
-        throw new Error('No hay datos disponibles para el rango de fechas especificado');
-      }
-
-      this.logger.log(`📊 Datos obtenidos: ${sensorData.length} registros`);
-
-      const pdfPath = await this.generatePDF(report, params, sensorData);
-      const excelPath = await this.generateExcel(report, params, sensorData);
-      
-      const filePaths = { pdfPath, excelPath };
-      const filePathsJson = JSON.stringify(filePaths);
-
-      const updatedReport = await this.prisma.report.update({
-        where: { id: reportId },
-        data: {
-          status: 'COMPLETED',
-          filePath: filePathsJson, 
-        },
-        include: { user: true }
-      });
-
-      this.logger.log(`✅ Reporte ${reportId} completado exitosamente`);
-
-      this.eventsGateway.broadcastReportUpdate({
-        ...updatedReport,
-        status: 'COMPLETED',
-        filePath: filePathsJson,
-        userId: updatedReport.userId,
-      });
-
-      const userSettings = updatedReport.user.settings ? JSON.parse(updatedReport.user.settings as string) : {};
-      const emailReportsEnabled = userSettings.notifications?.reports === true && userSettings.notifications?.email === true;
-      
-      if (emailReportsEnabled) {
-          const bufferPDF = await fs.readFile(path.join(this.reportsDir, pdfPath));
-          const bufferExcel = await fs.readFile(path.join(this.reportsDir, excelPath));
-
-          const attachments = [
-              { filename: pdfPath, content: bufferPDF, contentType: 'application/pdf' },
-              { filename: excelPath, content: bufferExcel, contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
-          ];
-
-          const emailSubject = `✅ Reporte Generado: ${updatedReport.title}`;
-          const emailBody = `
-            <p>Estimado/a ${updatedReport.user.name},</p>
-            <p>Adjunto encontrará el reporte de monitoreo solicitado o generado automáticamente.</p>
-            <p><strong>Título:</strong> ${updatedReport.title}</p>
-            <p><strong>Período:</strong> ${format(parseISO(params.startDate), 'dd/MM/yyyy')} al ${format(parseISO(params.endDate), 'dd/MM/yyyy')}</p>
-            <p>Gracias por usar el Sistema de Monitoreo. </p>
-          `;
-          
-          await this.emailService.sendReportEmail(updatedReport.user.email, emailSubject, emailBody, attachments);
-      }
-
-    } catch (error) {
-      this.logger.error(`❌ Error procesando reporte ${reportId}:`, error);
-
-      await this.updateReportStatus(reportId, 'FAILED', error.message);
-    }
-  }
-
-  /**
-   * Genera archivo PDF del reporte (Ajustado para el formato solicitado)
-   */
-  private async generatePDF(
-    report: Report,
-    params: ReportParameters,
-    data: any[]
-  ): Promise<string> {
-
-    const paramsObj: ReportParameters = JSON.parse(report.parameters as string);
-    const isBatchReport = paramsObj.isAutomatic && paramsObj.automaticType === 'batch';
-    
-    const startDatePart = paramsObj.startDate.split('T')[0];
-    const endDatePart = paramsObj.endDate.split('T')[0];
-    
-    const start = format(parseISO(startDatePart), 'dd_MM_yyyy');
-    const end = format(parseISO(endDatePart), 'dd_MM_yyyy');
-    const tankName = paramsObj.tankName.replace(/ /g, '_');
-    const filename = `Reporte_Monitoreo_${tankName}_${start}_a_${end}.pdf`;
-
-    const filepath = path.join(this.reportsDir, filename);
-
-    const LOGO_PATH = path.join(this.assetsDir, 'logo-sena.png');
-    const VERDE_SENA = '#39B54A';
-    const NARANJA_CONSTRASTE = '#FF5733'; 
-    const itemHeight = 25;
-    const LOGO_WIDTH = 50;
-    const LOGO_MARGIN = 60; 
-
-    return new Promise(async (resolve, reject) => {
-      const doc = new PDFDocument({ margin: 50, size: 'A4' });
-      const stream = require('fs').createWriteStream(filepath);
-
-      stream.on('error', (err) => {
-          this.logger.error(`Error de Stream en PDF: ${err.message}`);
-          reject(new Error(`Error al crear archivo PDF: ${err.message}`));
-      });
-      
-      doc.pipe(stream);
-      
-      const startX = 50;
-      const colWidth = 100;
-      let currentY = 50;
-
-      // -----------------------------------------------------
-      // 1. ENCABEZADO y TÍTULO (Ajuste de alineación)
-      // -----------------------------------------------------
-      
-      try {
-        await fs.stat(LOGO_PATH); 
-        doc.image(LOGO_PATH, startX, currentY, { width: LOGO_WIDTH }); 
-      } catch {
-        doc.fillColor(VERDE_SENA).fontSize(24).text('SENA', startX, currentY);
-      }
-      
-      const titleX = startX + LOGO_MARGIN;
-      const titleWidth = 550 - LOGO_MARGIN;
-      
-      doc.fillColor('#000000')
-         .fontSize(18)
-         .text('Reporte de Monitoreo Acuático', titleX, currentY + 5, { 
-             width: titleWidth, 
-             align: 'center',
-             stroke: false
-         });
-      
-      doc.fontSize(10)
-         .text('Servicio Nacional de Aprendizaje - SENA', titleX, currentY + 30, { 
-             width: titleWidth, 
-             align: 'center',
-             stroke: false
-         });
-      
-      doc.y = currentY + 60; 
-      
-      // -----------------------------------------------------
-      // 2. METADATOS DEL REPORTE
-      // -----------------------------------------------------
-      doc.fontSize(12).text('Título: ', startX, doc.y, { continued: true })
-         .font('Helvetica-Bold')
-         .text(report.title);
-      
-      const periodText = isBatchReport 
-        ? report.title.match(/\(([^)]+)\)/)?.[1] || 'Período no especificado'
-        : `${format(parseISO(startDatePart), 'dd/MM/yyyy', { locale: es })} al ${format(parseISO(endDatePart), 'dd/MM/yyyy', { locale: es })}`;
-
-      doc.fontSize(12).text('Período: ', startX, doc.y, { continued: true })
-         .font('Helvetica')
-         .text(periodText);
-
-      doc.moveDown(0.5);
-      
-      // -----------------------------------------------------
-      // 3. TABLA DE ESTADÍSTICAS (Resumen)
-      // -----------------------------------------------------
-      const stats = this.aggregateStats(data);
-      
-      const tableTop = doc.y + 10;
-      currentY = tableTop;
-
-      doc.rect(startX, currentY, 500, itemHeight).fill(VERDE_SENA);
-      doc.fillColor('#FFFFFF').fontSize(10);
-      doc.text('Tipo de Sensor', startX + 5, currentY + 8, { width: colWidth });
-      doc.text('Nº Registros', startX + colWidth + 5, currentY + 8, { width: colWidth, align: 'center' });
-      doc.text('Promedio', startX + colWidth * 2 + 5, currentY + 8, { width: colWidth, align: 'center' });
-      doc.text('Mínimo', startX + colWidth * 3 + 5, currentY + 8, { width: colWidth, align: 'center' });
-      doc.text('Máximo', startX + colWidth * 4 + 5, currentY + 8, { width: colWidth, align: 'center' });
-
-      currentY += itemHeight;
-
-      stats.forEach((stat, index) => {
-          const isEven = index % 2 === 0;
-          doc.fillColor(isEven ? '#FFFFFF' : '#F0F0F0').rect(startX, currentY, 500, itemHeight).fill();
-          
-          doc.fillColor('#000000').fontSize(10);
-          doc.text(stat.sensorName, startX + 5, currentY + 8, { width: colWidth });
-          doc.text(stat.count.toString(), startX + colWidth + 5, currentY + 8, { width: colWidth, align: 'center' });
-          doc.text(stat.avg, startX + colWidth * 2 + 5, currentY + 8, { width: colWidth, align: 'center' });
-          doc.text(stat.min, startX + colWidth * 3 + 5, currentY + 8, { width: colWidth, align: 'center' });
-          doc.text(stat.max, startX + colWidth * 4 + 5, currentY + 8, { width: colWidth, align: 'center' });
-          
-          currentY += itemHeight;
-      });
-      
-      doc.y = currentY + 20; 
-      
-      // -----------------------------------------------------
-      // 4. TABLA DE DATOS DETALLADOS
-      // -----------------------------------------------------
-      
-      const dataTableTop = doc.y;
-      const dataItemHeight = 20;
-      const dataColWidths = [120, 100, 80, 200]; 
-      
-      doc.rect(startX, dataTableTop, 500, dataItemHeight).fill(NARANJA_CONSTRASTE); 
-      doc.fillColor('#FFFFFF').fontSize(10);
-      
-      let currentX = startX;
-      doc.text('Fecha/Hora', currentX + 5, dataTableTop + 6, { width: dataColWidths[0] });
-      currentX += dataColWidths[0];
-      doc.text('Tipo', currentX + 5, dataTableTop + 6, { width: dataColWidths[1] });
-      currentX += dataColWidths[1];
-      doc.text('Valor', currentX + 5, dataTableTop + 6, { width: dataColWidths[2] });
-      currentX += dataColWidths[2];
-      doc.text('Sensor', currentX + 5, dataTableTop + 6, { width: dataColWidths[3] });
-      
-      let currentDataY = dataTableTop + dataItemHeight;
-      let globalRowIndex = 0;
-
-      data.slice(0, 500).forEach((item) => { 
-          
-          if (currentDataY > 750) { 
-            doc.addPage();
-            currentDataY = 50;
-            currentX = startX;
-            doc.rect(startX, currentDataY, 500, dataItemHeight).fill(NARANJA_CONSTRASTE); 
-            doc.fillColor('#FFFFFF').fontSize(10);
-            doc.text('Fecha/Hora', currentX + 5, currentDataY + 6, { width: dataColWidths[0] });
-            currentX += dataColWidths[0];
-            doc.text('Tipo', currentX + 5, currentDataY + 6, { width: dataColWidths[1] });
-            currentX += dataColWidths[1];
-            doc.text('Valor', currentX + 5, currentDataY + 6, { width: dataColWidths[2] });
-            currentX += dataColWidths[2];
-            doc.text('Sensor', currentX + 5, currentDataY + 6, { width: dataColWidths[3] });
-            currentDataY += dataItemHeight;
-          }
-          
-          currentX = startX;
-          const rowColor = (globalRowIndex % 2 === 0) ? '#FFFFFF' : '#F7F7F7'; 
-          doc.fillColor(rowColor).rect(startX, currentDataY, 500, dataItemHeight).fill(rowColor); 
-
-          doc.fillColor('#000000').fontSize(9);
-          doc.text(format(item.timestamp, 'dd/MM/yy HH:mm', { locale: es }), currentX + 5, currentDataY + 6, { width: dataColWidths[0] });
-          currentX += dataColWidths[0];
-          doc.text(item.sensor.type, currentX + 5, currentDataY + 6, { width: dataColWidths[1] });
-          currentX += dataColWidths[1];
-          doc.text(item.value.toFixed(2), currentX + 5, currentDataY + 6, { width: dataColWidths[2] });
-          currentX += dataColWidths[2];
-          doc.text(item.sensor.name, currentX + 5, currentDataY + 6, { width: dataColWidths[3] });
-
-          currentDataY += dataItemHeight;
-          globalRowIndex++; 
-      });
-
-      doc.end();
-
-      stream.on('finish', () => {
-        this.logger.log(`📄 PDF generado: ${filename}`);
-        resolve(filename);
-      });
-
-      stream.on('error', reject);
-    });
-  }
-
-  /**
-   * Genera archivo Excel del reporte con filtros y formato profesional
-   */
-   private async generateExcel(
-    report: Report,
-    params: ReportParameters,
-    data: any[]
-  ): Promise<string> {
-    
-    const paramsObj: ReportParameters = JSON.parse(report.parameters as string);
-    
-    const startDatePart = paramsObj.startDate.split('T')[0];
-    const endDatePart = paramsObj.endDate.split('T')[0];
-    
-    const start = format(parseISO(startDatePart), 'dd_MM_yyyy');
-    const end = format(parseISO(endDatePart), 'dd_MM_yyyy');
-    const tankName = paramsObj.tankName.replace(/ /g, '_');
-    
-    const filename = `Reporte_Monitoreo_${tankName}_${start}_a_${end}.xlsx`;
-
-    const filepath = path.join(this.reportsDir, filename);
-
-    const workbook = new ExcelJS.Workbook();
-    workbook.creator = 'Sistema de Monitoreo';
-    workbook.created = new Date();
-
-    const dataSheet = workbook.addWorksheet('Datos Completos', {
-      views: [{ state: 'frozen', xSplit: 0, ySplit: 2 }] 
-    });
-    const statsSheet = workbook.addWorksheet('Resumen');
-    
-    const VERDE_SENA_ARGB = 'FF39B54A';
-    const NARANJA_CONSTRASTE_ARGB = 'FFDD5733'; 
-    const GRIS_CLARO_ARGB = 'FFF5F5F5';
-    const stats = this.aggregateStats(data); 
-    const COLUMNAS_ESTADISTICAS = 5;
-
-    // -----------------------------------------------------
-    // HOJA DE RESUMEN/ESTADÍSTICAS
-    // -----------------------------------------------------
-    
-    statsSheet.mergeCells('A1:E1');
-    statsSheet.getCell('A1').value = 'Reporte de Monitoreo Acuático';
-    statsSheet.getCell('A1').font = { size: 18, bold: true };
-    statsSheet.getCell('A1').alignment = { horizontal: 'center', vertical: 'middle' };
-    statsSheet.getRow(1).height = 30; 
-    
-    statsSheet.mergeCells('A2:E2');
-    statsSheet.getCell('A2').value = 'Servicio Nacional de Aprendizaje - SENA';
-    statsSheet.getCell('A2').alignment = { horizontal: 'center', vertical: 'middle' };
-    statsSheet.getRow(2).height = 20; 
-
-    statsSheet.getCell('A4').value = 'Título:';
-    statsSheet.getCell('B4').value = report.title;
-    statsSheet.getCell('A5').value = 'Período:';
-    statsSheet.getCell('B5').value = `${format(parseISO(startDatePart), 'dd/MM/yyyy')} al ${format(parseISO(endDatePart), 'dd/MM/yyyy')}`;
-    
-    statsSheet.getCell('A7').value = 'Total de Registros Monitoreados:'; 
-    statsSheet.getCell('A7').font = { bold: true };
-    const lastStatRow = 9 + stats.length - 1;
-    statsSheet.getCell('B7').value = { formula: `SUM(B9:B${lastStatRow})` };
-    statsSheet.getCell('B7').fill = { 
-        type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9EAD3' }
-    };
-    statsSheet.getCell('B7').alignment = { vertical: 'middle', horizontal: 'center' };
-    statsSheet.getRow(7).height = 20; 
-
-    statsSheet.getRow(8).values = ['Tipo de Sensor', 'Nº Registros', 'Promedio', 'Mínimo', 'Máximo'];
-    statsSheet.getRow(8).height = 25;
-
-    statsSheet.getRow(8).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    statsSheet.getRow(8).fill = {
-      type: 'pattern',
-      pattern: 'solid',
-      fgColor: { argb: VERDE_SENA_ARGB }
-    };
-    statsSheet.getRow(8).alignment = { vertical: 'middle', horizontal: 'center' };
-
-    let row = 9;
-    stats.forEach((stat) => {
-        statsSheet.getRow(row).values = [
-            stat.sensorName,
-            stat.count,
-            stat.avg,
-            stat.min,
-            stat.max
-        ];
-        
-        if (row % 2 === 0) {
-          statsSheet.getRow(row).fill = {
-              type: 'pattern',
-              pattern: 'solid',
-              fgColor: { argb: GRIS_CLARO_ARGB }
-          };
-        }
-        statsSheet.getRow(row).alignment = { vertical: 'middle', horizontal: 'center' };
-        statsSheet.getRow(row).getCell(1).alignment = { horizontal: 'left' };
-        row++;
-    });
-    
-    statsSheet.columns = [
-        { width: 25 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 18 }
-    ];
-    
-    for (let i = 7; i < row; i++) { 
-        for (let j = 1; j <= COLUMNAS_ESTADISTICAS; j++) {
-            statsSheet.getRow(i).getCell(j).border = {
-                top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' }
-            };
-        }
-    }
-    
-    // -----------------------------------------------------
-    // HOJA DE DATOS COMPLETOS (Detallada)
-    // -----------------------------------------------------
-    
-    dataSheet.columns = [
-      { header: 'Fecha', key: 'date', width: 15 }, 
-      { header: 'Hora', key: 'time', width: 15 }, 
-      { header: 'Tipo', key: 'sensorType', width: 15 },
-      { 
-        header: 'Valor', 
-        key: 'value', 
-        width: 12,
-        style: { numFmt: '0.00' }
-      },
-      { header: 'Sensor', key: 'sensorName', width: 25 }, 
-      { header: 'Hardware ID', key: 'hardwareId', width: 15 },
-    ];
-    
-    const COLUMNAS_DATOS = dataSheet.columns.length; 
-
-    dataSheet.getRow(1).height = 25;
-    dataSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    dataSheet.getRow(1).fill = {
-      type: 'pattern',
-      pattern: 'solid',
-      fgColor: { argb: NARANJA_CONSTRASTE_ARGB }
-    };
-    dataSheet.getRow(1).alignment = { vertical: 'middle', horizontal: 'center' };
-
-    data.forEach(item => {
-        const datePart = format(item.timestamp, 'dd/MM/yyyy', { locale: es });
-        const timePart = format(item.timestamp, 'HH:mm:ss', { locale: es });
-
-      dataSheet.addRow({
-        date: datePart, 
-        time: timePart, 
-        sensorType: item.sensor.type,
-        value: item.value,
-        sensorName: item.sensor.name, 
-        hardwareId: item.sensor.hardwareId,
-      });
-    });
-
-    const lastDataRow = dataSheet.rowCount;
-    for (let i = 1; i <= lastDataRow; i++) {
-      for (let j = 1; j <= COLUMNAS_DATOS; j++) { 
-        const cell = dataSheet.getRow(i).getCell(j);
-        
-        cell.border = {
-          top: { style: 'thin', color: { argb: 'FFD3D3D3' } },
-          left: { style: 'thin', color: { argb: 'FFD3D3D3' } },
-          bottom: { style: 'thin', color: { argb: 'FFD3D3D3' } },
-          right: { style: 'thin', color: { argb: 'FFD3D3D3' } }
-        };
-        
-        if (i > 1 && i % 2 === 0) {
-          cell.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: GRIS_CLARO_ARGB }
-          };
-        }
-      }
-    }
-
-    dataSheet.autoFilter = {
-      from: { row: 1, column: 1 },
-      to: { row: 1, column: COLUMNAS_DATOS }
-    };
-
-    await workbook.xlsx.writeFile(filepath);
-    this.logger.log(`📊 Excel generado: ${filename}`);
-
-    return filename;
-  }
-
-  /**
-   * Actualiza el estado de un reporte
-   */
-  private async updateReportStatus(
-    reportId: string,
-    status: ReportStatus,
-    errorMessage?: string
-  ) {
-    const updateData: any = {
-        status,
-    };
-    
-    if (errorMessage) {
-        updateData.errorMessage = errorMessage;
-    }
-
-    const report = await this.prisma.report.update({
-      where: { id: reportId },
-      data: updateData,
-    });
-
-    this.eventsGateway.broadcastReportUpdate({
-      ...report,
-      userId: report.userId,
-    });
-  }
-
-  /**
-   * Obtiene todos los reportes de un usuario
-   */
+ 
+  /** Obtiene todos los reportes de un usuario ordenados por fecha */
   async getReports(userId: string): Promise<Report[]> {
     return this.prisma.report.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
+      take: 100, // Limitar a los 100 más recientes
     });
   }
-
-  /**
-   * Descarga un reporte generado
-   */
-  async downloadReport(reportId: string, fileFormat: 'pdf' | 'xlsx'): Promise<{ buffer: Buffer, filename: string }> { // <--- CAMBIO DE RETORNO
+ 
+  /** Descarga un reporte completado */
+  async downloadReport(
+    reportId: string,
+    fileFormat: 'pdf' | 'xlsx',
+  ): Promise<{ buffer: Buffer; filename: string }> {
     const report = await this.prisma.report.findUnique({
       where: { id: reportId },
-      include: { user: true }
     });
-
-    if (!report) {
-      throw new NotFoundException('Reporte no encontrado');
+    if (!report) throw new NotFoundException('Reporte no encontrado');
+ 
+    if (report.status === 'PENDING' || report.status === 'PROCESSING') {
+      throw new BadRequestException(
+        `El reporte aún se está procesando (estado: ${report.status})`,
+      );
     }
-
-    if (report.status !== 'COMPLETED') {
-      throw new BadRequestException('El reporte aún no está disponible');
+ 
+    if (report.status === 'FAILED') {
+      const params: ReportParameters = JSON.parse(report.parameters as string);
+      const retries = params.retryCount ?? 0;
+      throw new BadRequestException(
+        `El reporte falló después de ${retries} intentos. Cree un nuevo reporte.`,
+      );
     }
-
+ 
     const paths = this.getReportPaths(report);
-    if (!paths) {
-        throw new NotFoundException(`Archivos no disponibles en el reporte`);
+    if (!paths) throw new NotFoundException('Archivos del reporte no disponibles');
+ 
+    const filePath =
+      fileFormat === 'pdf' ? paths.pdfPath : paths.excelPath;
+    if (!filePath) {
+      throw new NotFoundException(
+        `Archivo ${fileFormat.toUpperCase()} no disponible`,
+      );
     }
-
-    const paramsObj: ReportParameters = JSON.parse(report.parameters as string);
-    
-    const startDatePart = paramsObj.startDate.split('T')[0];
-    const endDatePart = paramsObj.endDate.split('T')[0];
-    
-    const start = format(parseISO(startDatePart), 'dd_MM_yyyy');
-    const end = format(parseISO(endDatePart), 'dd_MM_yyyy');
-    const tankName = paramsObj.tankName.replace(/ /g, '_'); 
-    
-    const baseName = `Reporte_Monitoreo_${tankName}_${start}_a_${end}`;
-    
-    const extension = fileFormat === 'pdf' ? 'pdf' : 'xlsx';
-    const filename = `${baseName}.${extension}`; 
-    
-    const fileToDownload = fileFormat === 'pdf' ? paths.pdfPath : paths.excelPath;
-    
-    if (!fileToDownload) {
-      throw new NotFoundException(`Archivo ${fileFormat.toUpperCase()} no disponible`);
-    }
-
-    const filepath = path.join(this.reportsDir, fileToDownload);
-
+ 
+    const params: ReportParameters = JSON.parse(report.parameters as string);
+    const start = format(parseISO(params.startDate.split('T')[0]), 'dd_MM_yyyy');
+    const end = format(parseISO(params.endDate.split('T')[0]), 'dd_MM_yyyy');
+    const tankName = params.tankName.replace(/\s+/g, '_');
+    const filename = `Reporte_${tankName}_${start}_a_${end}.${fileFormat}`;
+ 
     try {
-      const buffer = await fs.readFile(filepath);
-      
-      return { buffer, filename }; 
-    } catch (error) {
-      this.logger.error(`Error leyendo archivo ${filepath}:`, error);
+      const buffer = await fs.readFile(path.join(REPORTS_DIR, filePath));
+      return { buffer, filename };
+    } catch {
       throw new NotFoundException('Archivo no encontrado en el servidor');
     }
   }
-
-  /**
-   * Elimina un reporte y sus archivos
-   */
+ 
+  /** Elimina un reporte y sus archivos asociados */
   async deleteReport(reportId: string, userId: string): Promise<void> {
     const report = await this.prisma.report.findUnique({
       where: { id: reportId },
     });
-
-    if (!report) {
-      throw new NotFoundException('Reporte no encontrado');
-    }
-
+    if (!report) throw new NotFoundException('Reporte no encontrado');
     if (report.userId !== userId) {
       throw new BadRequestException('No tienes permiso para eliminar este reporte');
     }
-
-    const paths = this.getReportPaths(report);
-
-    if (paths) {
-        if (paths.pdfPath) { 
-          try {
-            await fs.unlink(path.join(this.reportsDir, paths.pdfPath));
-          } catch (error) {
-            this.logger.warn(`No se pudo eliminar PDF: ${paths.pdfPath}`);
-          }
-        }
-
-        if (paths.excelPath) { 
-          try {
-            await fs.unlink(path.join(this.reportsDir, paths.excelPath));
-          } catch (error) {
-            this.logger.warn(`No se pudo eliminar Excel: ${paths.excelPath}`);
-          }
-        }
-    }
-
-    await this.prisma.report.delete({
+ 
+    await this.deleteReportFiles(report);
+    await this.prisma.report.delete({ where: { id: reportId } });
+    this.logger.log(`🗑️ Reporte ${reportId} eliminado`);
+  }
+ 
+  /**
+   * Reintenta manualmente un reporte fallido.
+   * Útil cuando el usuario lo solicita desde la UI.
+   */
+  async retryReport(reportId: string, userId: string): Promise<Report> {
+    const report = await this.prisma.report.findUnique({
       where: { id: reportId },
     });
-
-    this.logger.log(`🗑️ Reporte ${reportId} eliminado`);
+    if (!report) throw new NotFoundException('Reporte no encontrado');
+    if (report.userId !== userId) {
+      throw new BadRequestException('No tienes permiso para reintentar este reporte');
+    }
+    if (report.status !== 'FAILED') {
+      throw new BadRequestException(
+        `Solo se pueden reintentar reportes fallidos (estado actual: ${report.status})`,
+      );
+    }
+ 
+    // Resetear contador de reintentos
+    const params: ReportParameters = JSON.parse(report.parameters as string);
+    params.retryCount = 0;
+ 
+    const updated = await this.prisma.report.update({
+      where: { id: reportId },
+      data: {
+        status: 'PENDING',
+        parameters: JSON.stringify(params),
+        filePath: null,
+      },
+    });
+ 
+    this.enqueueJob(reportId);
+    this.logger.log(`🔄 Reintento manual solicitado para reporte ${reportId}`);
+    return updated;
+  }
+ 
+  // ─── Procesamiento Interno ───────────────────────────────────────────────────
+ 
+  /** Orquesta el procesamiento completo de un reporte */
+  private async processReport(reportId: string): Promise<void> {
+    this.logger.log(`⚙️ Procesando reporte ${reportId}...`);
+    await this.updateReportStatus(reportId, 'PROCESSING');
+ 
+    const report = await this.prisma.report.findUnique({
+      where: { id: reportId },
+      include: { user: true },
+    });
+    if (!report) throw new NotFoundException('Reporte no encontrado durante procesamiento');
+ 
+    const params: ReportParameters = JSON.parse(report.parameters as string);
+    const { gteDate, lteDate } = this.buildDateRange(params);
+ 
+    // Consulta optimizada: solo los campos necesarios
+    const sensorData = await this.prisma.sensorData.findMany({
+      where: {
+        sensorId: { in: params.sensorIds },
+        timestamp: { gte: gteDate, lte: lteDate },
+      },
+      orderBy: { timestamp: 'asc' },
+      select: {
+        timestamp: true,
+        value: true,
+        type: true,
+        sensor: {
+          select: { name: true, type: true, hardwareId: true },
+        },
+      },
+    });
+ 
+    if (sensorData.length === 0) {
+      throw new Error(
+        `No hay datos entre ${gteDate.toISOString()} y ${lteDate.toISOString()}`,
+      );
+    }
+ 
+    this.logger.log(
+      `📊 Reporte ${reportId}: ${sensorData.length} registros encontrados`,
+    );
+ 
+    // Generar archivos en paralelo
+    const [pdfPath, excelPath] = await Promise.all([
+      this.generatePDF(report, params, sensorData),
+      this.generateExcel(report, params, sensorData),
+    ]);
+ 
+    const filePaths: ReportFilePaths = { pdfPath, excelPath };
+    const updatedReport = await this.prisma.report.update({
+      where: { id: reportId },
+      data: {
+        status: 'COMPLETED',
+        filePath: JSON.stringify(filePaths),
+      },
+      include: { user: true },
+    });
+ 
+    this.logger.log(`✅ Reporte ${reportId} completado`);
+ 
+    // Notificar via WebSocket
+    this.eventsGateway.broadcastReportUpdate({
+      ...updatedReport,
+      userId: updatedReport.userId,
+    });
+ 
+    // Enviar email si está configurado
+    await this.sendReportEmailIfEnabled(updatedReport, params, pdfPath, excelPath);
+  }
+ 
+  // ─── Generación de Archivos ──────────────────────────────────────────────────
+ 
+  private async generatePDF(
+    report: any,
+    params: ReportParameters,
+    data: any[],
+  ): Promise<string> {
+    const startPart = params.startDate.split('T')[0];
+    const endPart = params.endDate.split('T')[0];
+    const start = format(parseISO(startPart), 'dd_MM_yyyy');
+    const end = format(parseISO(endPart), 'dd_MM_yyyy');
+    const tankName = params.tankName.replace(/\s+/g, '_');
+    const filename = `Reporte_Monitoreo_${tankName}_${start}_a_${end}.pdf`;
+    const filepath = path.join(REPORTS_DIR, filename);
+ 
+    const VERDE_SENA = '#39B54A';
+    const NARANJA = '#FF5733';
+    const itemHeight = 25;
+    const colWidth = 100;
+ 
+    return new Promise((resolve, reject) => {
+      const doc = new PDFDocument({ margin: 50, size: 'A4' });
+      const stream = require('fs').createWriteStream(filepath);
+      stream.on('error', reject);
+      doc.pipe(stream);
+ 
+      const startX = 50;
+      let currentY = 50;
+ 
+      // Cabecera
+      doc
+        .fillColor('#000000')
+        .fontSize(18)
+        .text('Reporte de Monitoreo Acuático', startX, currentY + 5, {
+          width: 500,
+          align: 'center',
+        });
+      doc
+        .fontSize(10)
+        .text('Servicio Nacional de Aprendizaje - SENA', startX, currentY + 30, {
+          width: 500,
+          align: 'center',
+        });
+      doc.y = currentY + 60;
+ 
+      // Metadatos
+      doc
+        .fontSize(12)
+        .text('Título: ', startX, doc.y, { continued: true })
+        .font('Helvetica-Bold')
+        .text(report.title);
+      const isBatch = params.isAutomatic && params.automaticType === 'batch';
+      const periodText = isBatch
+        ? 'Reporte por lote automático'
+        : `${format(parseISO(startPart), 'dd/MM/yyyy', { locale: es })} al ${format(parseISO(endPart), 'dd/MM/yyyy', { locale: es })}`;
+      doc
+        .fontSize(12)
+        .font('Helvetica')
+        .text('Período: ', startX, doc.y, { continued: true })
+        .text(periodText);
+      doc.moveDown(0.5);
+ 
+      // Tabla de estadísticas
+      const stats = this.aggregateStats(data);
+      currentY = doc.y + 10;
+      doc.rect(startX, currentY, 500, itemHeight).fill(VERDE_SENA);
+      doc.fillColor('#FFFFFF').fontSize(10);
+      doc.text('Tipo de Sensor', startX + 5, currentY + 8, { width: colWidth });
+      doc.text('Registros', startX + colWidth + 5, currentY + 8, { width: colWidth, align: 'center' });
+      doc.text('Promedio', startX + colWidth * 2 + 5, currentY + 8, { width: colWidth, align: 'center' });
+      doc.text('Mínimo', startX + colWidth * 3 + 5, currentY + 8, { width: colWidth, align: 'center' });
+      doc.text('Máximo', startX + colWidth * 4 + 5, currentY + 8, { width: colWidth, align: 'center' });
+      currentY += itemHeight;
+ 
+      stats.forEach((stat, i) => {
+        const isEven = i % 2 === 0;
+        doc.fillColor(isEven ? '#FFFFFF' : '#F0F0F0').rect(startX, currentY, 500, itemHeight).fill();
+        doc.fillColor('#000000').fontSize(10);
+        doc.text(stat.sensorName, startX + 5, currentY + 8, { width: colWidth });
+        doc.text(String(stat.count), startX + colWidth + 5, currentY + 8, { width: colWidth, align: 'center' });
+        doc.text(stat.avg, startX + colWidth * 2 + 5, currentY + 8, { width: colWidth, align: 'center' });
+        doc.text(stat.min, startX + colWidth * 3 + 5, currentY + 8, { width: colWidth, align: 'center' });
+        doc.text(stat.max, startX + colWidth * 4 + 5, currentY + 8, { width: colWidth, align: 'center' });
+        currentY += itemHeight;
+      });
+ 
+      doc.y = currentY + 20;
+ 
+      // Tabla de datos detallados (limitada a MAX_DATA_ROWS_PDF)
+      const dataColWidths = [120, 100, 80, 200];
+      const dataItemH = 20;
+      let dataY = doc.y;
+ 
+      const renderDataHeader = () => {
+        doc.rect(startX, dataY, 500, dataItemH).fill(NARANJA);
+        doc.fillColor('#FFFFFF').fontSize(10);
+        let cx = startX;
+        doc.text('Fecha/Hora', cx + 5, dataY + 6, { width: dataColWidths[0] }); cx += dataColWidths[0];
+        doc.text('Tipo', cx + 5, dataY + 6, { width: dataColWidths[1] }); cx += dataColWidths[1];
+        doc.text('Valor', cx + 5, dataY + 6, { width: dataColWidths[2] }); cx += dataColWidths[2];
+        doc.text('Sensor', cx + 5, dataY + 6, { width: dataColWidths[3] });
+        dataY += dataItemH;
+      };
+      renderDataHeader();
+ 
+      const limited = data.slice(0, MAX_DATA_ROWS_PDF);
+      limited.forEach((item, idx) => {
+        if (dataY > 750) {
+          doc.addPage();
+          dataY = 50;
+          renderDataHeader();
+        }
+        const rowColor = idx % 2 === 0 ? '#FFFFFF' : '#F7F7F7';
+        doc.fillColor(rowColor).rect(startX, dataY, 500, dataItemH).fill(rowColor);
+        doc.fillColor('#000000').fontSize(9);
+        let cx = startX;
+        doc.text(format(item.timestamp, 'dd/MM/yy HH:mm', { locale: es }), cx + 5, dataY + 6, { width: dataColWidths[0] }); cx += dataColWidths[0];
+        doc.text(item.sensor.type, cx + 5, dataY + 6, { width: dataColWidths[1] }); cx += dataColWidths[1];
+        doc.text((item.value as number).toFixed(2), cx + 5, dataY + 6, { width: dataColWidths[2] }); cx += dataColWidths[2];
+        doc.text(item.sensor.name, cx + 5, dataY + 6, { width: dataColWidths[3] });
+        dataY += dataItemH;
+      });
+ 
+      if (data.length > MAX_DATA_ROWS_PDF) {
+        doc.y = dataY + 10;
+        doc.fontSize(9).fillColor('#999999').text(
+          `* Se muestran ${MAX_DATA_ROWS_PDF} de ${data.length} registros en el PDF. El archivo Excel contiene todos los datos.`,
+          startX,
+        );
+      }
+ 
+      doc.end();
+      stream.on('finish', () => {
+        this.logger.log(`📄 PDF generado: ${filename}`);
+        resolve(filename);
+      });
+    });
+  }
+ 
+  private async generateExcel(
+    report: any,
+    params: ReportParameters,
+    data: any[],
+  ): Promise<string> {
+    const startPart = params.startDate.split('T')[0];
+    const endPart = params.endDate.split('T')[0];
+    const start = format(parseISO(startPart), 'dd_MM_yyyy');
+    const end = format(parseISO(endPart), 'dd_MM_yyyy');
+    const tankName = params.tankName.replace(/\s+/g, '_');
+    const filename = `Reporte_Monitoreo_${tankName}_${start}_a_${end}.xlsx`;
+    const filepath = path.join(REPORTS_DIR, filename);
+ 
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Sistema de Monitoreo';
+ 
+    const VERDE_ARGB = 'FF39B54A';
+    const NARANJA_ARGB = 'FFDD5733';
+    const GRIS_ARGB = 'FFF5F5F5';
+ 
+    // ── Hoja Resumen ────
+    const statsSheet = workbook.addWorksheet('Resumen');
+    statsSheet.mergeCells('A1:E1');
+    statsSheet.getCell('A1').value = 'Reporte de Monitoreo Acuático';
+    statsSheet.getCell('A1').font = { size: 18, bold: true };
+    statsSheet.getCell('A1').alignment = { horizontal: 'center', vertical: 'middle' };
+    statsSheet.getRow(1).height = 30;
+ 
+    statsSheet.getCell('A4').value = 'Título:';
+    statsSheet.getCell('B4').value = report.title;
+    statsSheet.getCell('A5').value = 'Período:';
+    statsSheet.getCell('B5').value = `${format(parseISO(startPart), 'dd/MM/yyyy')} al ${format(parseISO(endPart), 'dd/MM/yyyy')}`;
+    statsSheet.getCell('A7').value = 'Total Registros:';
+    statsSheet.getCell('A7').font = { bold: true };
+    statsSheet.getCell('B7').value = data.length;
+ 
+    statsSheet.getRow(9).values = ['Tipo de Sensor', 'Registros', 'Promedio', 'Mínimo', 'Máximo'];
+    statsSheet.getRow(9).height = 25;
+    statsSheet.getRow(9).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    statsSheet.getRow(9).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: VERDE_ARGB } };
+    statsSheet.getRow(9).alignment = { vertical: 'middle', horizontal: 'center' };
+ 
+    const stats = this.aggregateStats(data);
+    stats.forEach((stat, i) => {
+      const row = statsSheet.getRow(10 + i);
+      row.values = [stat.sensorName, stat.count, stat.avg, stat.min, stat.max];
+      if (i % 2 === 0) {
+        row.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GRIS_ARGB } };
+      }
+      row.alignment = { vertical: 'middle', horizontal: 'center' };
+    });
+    statsSheet.columns = [{ width: 25 }, { width: 15 }, { width: 15 }, { width: 15 }, { width: 18 }];
+ 
+    // ── Hoja Datos ───────
+    const dataSheet = workbook.addWorksheet('Datos Completos', {
+      views: [{ state: 'frozen', xSplit: 0, ySplit: 1 }],
+    });
+    dataSheet.columns = [
+      { header: 'Fecha', key: 'date', width: 15 },
+      { header: 'Hora', key: 'time', width: 12 },
+      { header: 'Tipo', key: 'sensorType', width: 15 },
+      { header: 'Valor', key: 'value', width: 12, style: { numFmt: '0.00' } },
+      { header: 'Sensor', key: 'sensorName', width: 25 },
+      { header: 'Hardware ID', key: 'hardwareId', width: 18 },
+    ];
+ 
+    dataSheet.getRow(1).height = 25;
+    dataSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    dataSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: NARANJA_ARGB } };
+    dataSheet.getRow(1).alignment = { vertical: 'middle', horizontal: 'center' };
+ 
+    // Insertar todas las filas usando addRows para eficiencia en lotes grandes
+    const rows = data.map((item) => ({
+      date: format(item.timestamp, 'dd/MM/yyyy', { locale: es }),
+      time: format(item.timestamp, 'HH:mm:ss', { locale: es }),
+      sensorType: item.sensor.type,
+      value: item.value,
+      sensorName: item.sensor.name,
+      hardwareId: item.sensor.hardwareId,
+    }));
+    dataSheet.addRows(rows);
+ 
+    // Alternar colores filas
+    for (let i = 2; i <= dataSheet.rowCount; i++) {
+      if (i % 2 === 0) {
+        dataSheet.getRow(i).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GRIS_ARGB } };
+      }
+    }
+ 
+    dataSheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
+ 
+    await workbook.xlsx.writeFile(filepath);
+    this.logger.log(`📊 Excel generado: ${filename}`);
+    return filename;
+  }
+ 
+  // ─── Reporte por Lote Automático ─────────────────────────────────────────────
+ 
+  private async generateAutomaticBatchReport(
+    tankId: string,
+    userId: string,
+  ): Promise<void> {
+    const tank = await this.prisma.tank.findUnique({
+      where: { id: tankId },
+      include: { sensors: { select: { id: true } } },
+    });
+    if (!tank) return;
+ 
+    const batchData = await this.prisma.sensorData.findMany({
+      where: { sensor: { tankId } },
+      orderBy: { timestamp: 'desc' },
+      select: { timestamp: true },
+      take: 200,
+    });
+    if (!batchData.length) return;
+ 
+    const newest = batchData[0].timestamp;
+    const oldest = batchData[batchData.length - 1].timestamp;
+    const startTitle = format(oldest, 'dd/MM/yyyy HH:mm:ss');
+    const endTitle = format(newest, 'dd/MM/yyyy HH:mm:ss');
+ 
+    await this.createReport({
+      reportName: `Reporte por Lote - ${tank.name} (200 datos del ${startTitle} al ${endTitle})`,
+      userId,
+      tankId,
+      sensorIds: tank.sensors.map((s) => s.id),
+      startDate: oldest.toISOString(),
+      endDate: newest.toISOString(),
+      isAutomatic: true,
+    });
+  }
+ 
+  // ─── Helpers Internos ────────────────────────────────────────────────────────
+ 
+  private buildDateRange(
+    params: ReportParameters,
+  ): { gteDate: Date; lteDate: Date } {
+    const isBatch = params.isAutomatic && params.automaticType === 'batch';
+    if (isBatch) {
+      return { gteDate: new Date(params.startDate), lteDate: new Date(params.endDate) };
+    }
+    return {
+      gteDate: new Date(params.startDate + 'T00:00:00Z'),
+      lteDate: new Date(params.endDate + 'T23:59:59Z'),
+    };
+  }
+ 
+  private aggregateStats(data: any[]): AggregatedStat[] {
+    const groups = data.reduce<Record<string, { values: number[]; name: string }>>(
+      (acc, item) => {
+        const key = item.sensor.name;
+        if (!acc[key]) acc[key] = { values: [], name: key };
+        acc[key].values.push(item.value as number);
+        return acc;
+      },
+      {},
+    );
+ 
+    return Object.values(groups).map((g) => {
+      const sum = g.values.reduce((a, b) => a + b, 0);
+      return {
+        sensorName: g.name,
+        count: g.values.length,
+        avg: (sum / g.values.length).toFixed(2),
+        min: Math.min(...g.values).toFixed(2),
+        max: Math.max(...g.values).toFixed(2),
+      };
+    });
+  }
+ 
+  private getReportPaths(report: Report): ReportFilePaths | null {
+    if (!report.filePath) return null;
+    try {
+      const parsed = JSON.parse(report.filePath as string);
+      if (parsed.pdfPath && parsed.excelPath) return parsed as ReportFilePaths;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+ 
+  private async deleteReportFiles(report: Report): Promise<void> {
+    const paths = this.getReportPaths(report);
+    if (!paths) return;
+    for (const filePath of [paths.pdfPath, paths.excelPath]) {
+      if (!filePath) continue;
+      try {
+        await fs.unlink(path.join(REPORTS_DIR, filePath));
+      } catch {
+        // El archivo puede no existir ya
+      }
+    }
+  }
+ 
+  private async updateReportStatus(
+    reportId: string,
+    status: ReportStatus,
+    errorMessage?: string,
+  ): Promise<void> {
+    const report = await this.prisma.report.update({
+      where: { id: reportId },
+      data: { status },
+    });
+    this.eventsGateway.broadcastReportUpdate({
+      ...report,
+      userId: report.userId,
+    });
+ 
+    if (status === 'FAILED') {
+      this.logger.error(
+        `💀 Reporte ${reportId} FAILED: ${errorMessage ?? 'sin detalles'}`,
+      );
+    }
+  }
+ 
+  private async sendReportEmailIfEnabled(
+    report: any,
+    params: ReportParameters,
+    pdfPath: string,
+    excelPath: string,
+  ): Promise<void> {
+    const settings = this.parseUserSettings(report.user?.settings);
+    if (!settings.notifications?.reports || !settings.notifications?.email) return;
+ 
+    try {
+      const [bufPDF, bufExcel] = await Promise.all([
+        fs.readFile(path.join(REPORTS_DIR, pdfPath)),
+        fs.readFile(path.join(REPORTS_DIR, excelPath)),
+      ]);
+ 
+      const attachments = [
+        { filename: pdfPath, content: bufPDF, contentType: 'application/pdf' },
+        {
+          filename: excelPath,
+          content: bufExcel,
+          contentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        },
+      ];
+ 
+      const body = `
+        <p>Estimado/a ${report.user.name},</p>
+        <p>Su reporte de monitoreo ha sido generado exitosamente.</p>
+        <p><strong>Título:</strong> ${report.title}</p>
+        <p><strong>Período:</strong> ${params.startDate} al ${params.endDate}</p>
+        <p>Gracias por usar el Sistema de Monitoreo.</p>
+      `;
+ 
+      await this.emailService.sendReportEmail(
+        report.user.email,
+        `✅ Reporte Generado: ${report.title}`,
+        body,
+        attachments,
+      );
+    } catch (err: any) {
+      this.logger.error(`Error enviando email de reporte: ${err.message}`);
+    }
+  }
+ 
+  private parseUserSettings(settings: any): any {
+    if (!settings) return {};
+    if (typeof settings === 'string') {
+      try {
+        return JSON.parse(settings);
+      } catch {
+        return {};
+      }
+    }
+    return settings;
   }
 }
