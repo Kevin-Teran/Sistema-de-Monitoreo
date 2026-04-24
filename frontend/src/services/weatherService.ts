@@ -10,7 +10,7 @@
  */
 
 const WEATHER_API_KEY = process.env.NEXT_PUBLIC_OPENWEATHERMAP_API_KEY || '56661711020895ed3c361ae25d46de7a';
-
+ 
 interface OpenWeatherItem {
   dt: number;
   main: {
@@ -25,7 +25,7 @@ interface OpenWeatherItem {
     icon: string;
   }>;
 }
-
+ 
 interface OpenWeatherResponse {
   list: OpenWeatherItem[];
   city?: {
@@ -33,7 +33,7 @@ interface OpenWeatherResponse {
     coord: { lat: number; lon: number };
   };
 }
-
+ 
 export interface WeatherForecast {
   date: string; // ISO format: yyyy-MM-dd
   temp: number;
@@ -44,13 +44,13 @@ export interface WeatherForecast {
   description: string;
   icon: string;
 }
-
+ 
 /**
  * @description Intenta extraer coordenadas si el formato es "lat,lon"
  */
 const parseCoordinates = (location: string): { lat: number; lon: number } | null => {
   if (!location || typeof location !== 'string') return null;
-
+ 
   const cleaned = location.trim();
   if (cleaned.includes(',')) {
     const parts = cleaned.split(',').map(part => parseFloat(part.trim()));
@@ -63,7 +63,7 @@ const parseCoordinates = (location: string): { lat: number; lon: number } | null
   }
   return null;
 };
-
+ 
 /**
  * @description Formatea una fecha Unix timestamp a formato ISO yyyy-MM-dd
  * Esto es CRÍTICO para evitar Invalid Date al parsear después con new Date()
@@ -75,7 +75,7 @@ const formatToIsoDate = (dt: number): string => {
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 };
-
+ 
 /**
  * @description Obtiene el pronóstico del clima para una ubicación (Coords o Ciudad)
  * @param {string} location - Puede ser coordenadas "4.71,-74.07" o ciudad "Barranquilla"
@@ -90,10 +90,10 @@ export const getWeatherForecast = async (
       console.warn('⚠️ Ubicación vacía, omitiendo clima.');
       return [];
     }
-
+ 
     let apiUrl = '';
     const coords = parseCoordinates(location);
-
+ 
     if (coords) {
       console.log(`🌤️ Buscando clima por coordenadas: ${coords.lat}, ${coords.lon}`);
       apiUrl = `https://api.openweathermap.org/data/2.5/forecast?lat=${coords.lat}&lon=${coords.lon}&appid=${WEATHER_API_KEY}&units=metric&lang=es`;
@@ -102,9 +102,9 @@ export const getWeatherForecast = async (
       console.log(`🌤️ Buscando clima por ciudad: "${location}"`);
       apiUrl = `https://api.openweathermap.org/data/2.5/forecast?q=${cityQuery}&appid=${WEATHER_API_KEY}&units=metric&lang=es`;
     }
-
+ 
     const response = await fetch(apiUrl, { cache: 'no-store' });
-
+ 
     if (!response.ok) {
       if (response.status === 404) {
         console.warn(`⚠️ Ciudad no encontrada: ${location}`);
@@ -113,40 +113,60 @@ export const getWeatherForecast = async (
       }
       return [];
     }
-
+ 
     const data: OpenWeatherResponse = await response.json();
-
+ 
     if (!data.list || data.list.length === 0) {
       return [];
     }
-
+ 
     return processForecastData(data.list, days);
-
+ 
   } catch (error: any) {
     console.error('❌ Error crítico en servicio de clima:', error.message);
     return [];
   }
 };
-
+ 
+/**
+ * @description Obtiene la fecha ISO de hoy (yyyy-MM-dd) en hora local
+ */
+const getTodayIso = (): string => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+ 
 /**
  * @description Procesa los datos crudos de la API
- * FIX: Usar formatToIsoDate() en lugar de toLocaleDateString() para evitar Invalid Date
+ * FIX 1: Usar formatToIsoDate() en lugar de toLocaleDateString() para evitar Invalid Date
+ * FIX 2: Excluir el día de hoy del forecast (queremos solo días FUTUROS)
+ *        para evitar que idx=0 y idx=1 sean el mismo día (hoy)
  */
 const processForecastData = (forecastList: OpenWeatherItem[], days: number): WeatherForecast[] => {
+  const todayIso = getTodayIso();
   const dailyData: { [isoDate: string]: OpenWeatherItem[] } = {};
-
+ 
   forecastList.forEach((item) => {
-    // FIX CRÍTICO: Usar formato ISO yyyy-MM-dd en lugar de toLocaleDateString
-    // toLocaleDateString('es-CO') produce "15/01/2025" que new Date() NO puede parsear
+    // FIX: Usar formato ISO yyyy-MM-dd para que new Date() lo parsee correctamente
     const isoDate = formatToIsoDate(item.dt);
     
+    // FIX: Excluir hoy del pronóstico - queremos los días SIGUIENTES
+    // Esto evita que "Hoy" y el primer día sean la misma fecha
+    if (isoDate === todayIso) return;
+ 
     if (!dailyData[isoDate]) {
       dailyData[isoDate] = [];
     }
     dailyData[isoDate].push(item);
   });
-
-  const dailyForecasts: WeatherForecast[] = Object.entries(dailyData)
+ 
+  // Ordenar por fecha ascendente para garantizar que el orden sea mañana, pasado, etc.
+  const sortedEntries = Object.entries(dailyData).sort(([a], [b]) => a.localeCompare(b));
+ 
+  const dailyForecasts: WeatherForecast[] = sortedEntries
     .slice(0, days)
     .map(([isoDate, items]) => {
       const temps = items.map(i => i.main.temp);
@@ -156,9 +176,11 @@ const processForecastData = (forecastList: OpenWeatherItem[], days: number): Wea
       const feels_like = items.map(i => i.main.feels_like);
       
       const representativeItem = items[Math.floor(items.length / 2)];
-
+ 
       return {
-        date: isoDate, // ISO format: "2025-01-15" - parseado correctamente por new Date()
+        // ISO format "2025-04-26" - será parseado con T12:00:00 en el frontend
+        // para evitar el bug de timezone (UTC medianoche → día anterior en UTC-5)
+        date: isoDate,
         temp: Math.round(average(temps) * 10) / 10, 
         temp_min: Math.min(...temps_min),
         temp_max: Math.max(...temps_max),
@@ -168,12 +190,12 @@ const processForecastData = (forecastList: OpenWeatherItem[], days: number): Wea
         icon: representativeItem.weather[0].icon,
       };
     });
-
+ 
   return dailyForecasts;
 };
-
+ 
 const average = (arr: number[]): number => arr.reduce((a, b) => a + b, 0) / arr.length;
-
+ 
 export const getWeatherIconUrl = (iconCode: string): string => {
   return `https://openweathermap.org/img/wn/${iconCode}@2x.png`;
 };
